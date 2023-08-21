@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net7.0;net7.0-android</TargetFrameworks>
+    <TargetFrameworks Condition=" '$(OS)' == 'Windows_NT' ">$(TargetFrameworks);net7.0-windows10.0.17763;</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ProjectGuid>{C039A143-D087-4868-A612-B5B90B171998}</ProjectGuid>
+    <PackageId>KinoshitaProductions.AuthClient</PackageId>
+    <AssemblyName>KinoshitaProductions.AuthClient</AssemblyName>
+    <RootNamespace>KinoshitaProductions.AuthClient</RootNamespace>
+    <Authors>Kinoshita Shimizu</Authors>
+    <Company>Kinoshita Productions</Company>
+    <PackageDescription>This is our user authentication library.</PackageDescription>
+    <RepositoryUrl>https://github.com/KinoshitaProductions/KinoshitaProductions.AuthClient.NET</RepositoryUrl>
+    <LangVersion>10</LangVersion>
+  </PropertyGroup>
+
+  <ImportGroup Condition=" $(TargetFramework.EndsWith('-android')) ">
+    <Import Project="KinoshitaProductions.AuthClient.Android.props" />
+  </ImportGroup>
+  <ImportGroup Condition=" $(TargetFramework.Contains('-windows')) ">
+	  <Import Project="KinoshitaProductions.AuthClient.Windows.props" />
+  </ImportGroup>
+  <ImportGroup Condition=" $(TargetFramework) != 'netstandard2.0' ">
+	  <Import Project="KinoshitaProductions.AuthClient.NotNetStandard.props" />
+  </ImportGroup>
+
+  <ItemGroup>
+    <PackageReference Include="KinoshitaProductions.Common" Version="1.0.0" />
+  </ItemGroup>
+
+</Project>

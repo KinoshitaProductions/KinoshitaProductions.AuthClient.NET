@@ -1,0 +1,8 @@
+<Project>
+  <PropertyGroup>
+    <DefineConstants>ANDROID</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Xamarin.Google.Guava.ListenableFuture" Version="1.0.0.10" />
+  </ItemGroup>
+</Project>
