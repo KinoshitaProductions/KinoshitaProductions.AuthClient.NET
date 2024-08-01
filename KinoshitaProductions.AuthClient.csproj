@@ -1,8 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>net7.0;net7.0-android</TargetFrameworks>
-    <TargetFrameworks Condition=" '$(OS)' == 'Windows_NT' ">$(TargetFrameworks);net7.0-windows10.0.17763;</TargetFrameworks>
+    <TargetFrameworks>net9.0;net9.0-android</TargetFrameworks>
+    <TargetFrameworks Condition=" '$(OS)' == 'Windows_NT' ">$(TargetFrameworks);net9.0-windows10.0.17763;</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <ProjectGuid>{C039A143-D087-4868-A612-B5B90B171998}</ProjectGuid>
     <PackageId>KinoshitaProductions.AuthClient</PackageId>
@@ -26,7 +26,8 @@
   </ImportGroup>
 
   <ItemGroup>
-    <PackageReference Include="KinoshitaProductions.Common" Version="1.0.0" />
+    <PackageReference Include="KinoshitaProductions.Common" Version="1.0.1" />
+    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.0.1" />
   </ItemGroup>
 
 </Project>
