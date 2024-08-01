@@ -2,11 +2,14 @@
 using Windows.Web.Http;
 #else
 using System.Net;
+using KinoshitaProductions.AuthClient.Enums;
 #endif
 using KinoshitaProductions.Common.Interfaces.AppInfo;
 using KinoshitaProductions.Common.Services;
 using KinoshitaProductions.Common.Enums;
 using Newtonsoft.Json;
+using Serilog;
+
 // ReSharper disable MemberCanBePrivate.Global
 // ReSharper disable UnusedMember.Global
 
@@ -15,360 +18,238 @@ namespace KinoshitaProductions.AuthClient.Services
     // ReSharper disable once ClassNeverInstantiated.Global
     public sealed class AuthManager
     {
-        // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
-        public bool HasElevatedPermissions => _credentials?.ElevatedToken != null;
-        private JwtTokenResponse? _credentials;
-        private readonly bool _isTemporaryOnly;
+        public bool HasPendingToPersistTokens;
+        public bool HasElevatedPermissions => _credentialStore.HasToken(JwtTokenKind.Elevated);
+        private readonly JwtTokenResponse _credentialStore;
         private readonly IJwtAuthenticatedServiceAppInfo _appInfo;
 
         public event Func<Task>? LoggedIn;
         public event Func<Task>? RestoredSession;
         public event Func<Task>? LoggedOut;
 
-        public AuthManager(IJwtAuthenticatedServiceAppInfo appInfo, bool isTemporaryOnly = false)
+        public AuthManager(IJwtAuthenticatedServiceAppInfo appInfo)
         {
             _appInfo = appInfo;
-            _isTemporaryOnly = isTemporaryOnly;
+            _credentialStore = new JwtTokenResponse(_appInfo);
         }
-
-        private async Task<bool> IsValidOrCanRenewAppToken()
+        public bool ScheduledToPersistAnyChanges() => HasPendingToPersistTokens;
+        public async Task PersistChangesAsync()
         {
-            if (_credentials == null) return false;
-            // we can start trying to renew the app token after 37 days
-            if (_credentials.AppTokenExpirationDate != null && DateTime.Now + TimeSpan.FromDays(37) > _credentials.AppTokenExpirationDate)
-            {
-                // we apply our tokens here for this operation
-                _appInfo.SetJwtAuthenticationCredentials(null, _credentials.AppToken, null /* we'll get a new session token for it */);
-
-                // we can only renew if there is an AppToken
-                if (await RenewCredentials(JwtTokenKind.App) == false)
-                {
-                    return false; // it's expired
-                }
-            }
-            return true;
+            HasPendingToPersistTokens |=
+                !await SettingsManager.TrySavingJson(_credentialStore.WithoutElevatedToken(), "___adt",
+                    CompressionAlgorithm.GZip);
         }
-
-        private async Task<bool> IsValidOrCanRenewSessionToken()
+        private Token? GetMainToken() => new [] { _credentialStore.GetToken(JwtTokenKind.App), _credentialStore.GetToken(JwtTokenKind.Elevated) }.FirstOrDefault(x => x?.IsValid == true);
+        public bool ScheduledToRenewAnyToken() => GetMainToken()?.ShouldConsiderRenewal == true ||
+                                             _credentialStore.GetToken(JwtTokenKind.Session)?.ShouldConsiderRenewal == true;
+        public async Task<AuthOperationResult> RenewTokensAsync()
         {
-            if (_credentials == null) return false;
-            // we can start trying to renew the session token after 3 days
-            if (_credentials.AppTokenExpirationDate != null && DateTime.Now + TimeSpan.FromDays(4) > _credentials.SessionTokenExpirationDate)
-            {
-                // we apply our tokens here for this operation
-                _appInfo.SetJwtAuthenticationCredentials(null, _credentials.AppToken, null /* this will cause the session to be considered expired, but we are asking for a new token anyways! */);
-
-                // let's try asking for a new token
-                if (await GetNewSessionToken() != true)
-                {
-                    // we apply our tokens here for this operation
-                    _appInfo.SetJwtAuthenticationCredentials(null, _credentials.AppToken, _credentials.SessionToken /* now we will try checking for the session validity*/);
-
-                    // we can only renew if there is an AppToken
-                    // should optimize this? We possibly actually call 3 times GetNewSessionToken() here
-                    if (await ValidateOrRenewSession() == false)
-                    {
-                        return false; // it's expired
-                    }
-                }
-            }
-            return true;
+            if (GetMainToken()?.ShouldConsiderRenewal == true)
+                return await RenewMainTokenAsync();
+            if (_credentialStore.GetToken(JwtTokenKind.Session)?.ShouldConsiderRenewal == true)
+                return await GetNewSessionTokenAsync();
+            return AuthOperationResult.NoOp;
         }
-        
         /// <summary>
         /// On app initialization, this should be called to load the credentials if possible.
         /// </summary>
         /// <returns></returns>
-        public async Task<bool> LoadCredentials()
+        public async Task<bool> LoadCredentialsAsync()
         {
-            var filePresence = _isTemporaryOnly /* for elevated login, do not load or save */ ? FilePresence.NotFound : await SettingsManager.ExistsAsync("___adt").ConfigureAwait(false);
-
-            if (filePresence == FilePresence.NotFound)
-                return false;
-
-            _credentials = await SettingsManager.TryLoadingJson<JwtTokenResponse>("___adt", filePresence, CompressionAlgorithm.GZip).ConfigureAwait(false);
-            
-            if (_credentials == null) return false; // couldn't parse
-            // if we are at 1 day before expiration or less, we can read it
-            if (DateTime.Now + TimeSpan.FromDays(1) < _credentials.AppTokenExpirationDate || DateTime.Now < _credentials.SessionTokenExpirationDate)
+            var filePresence = await SettingsManager.ExistsAsync("___adt").ConfigureAwait(false);
+            if (filePresence == FilePresence.NotFound) return false;
+            var storedCredentials = await SettingsManager.TryLoadingJson<JwtTokenResponse>("___adt", filePresence, CompressionAlgorithm.GZip).ConfigureAwait(false);
+            try
             {
-                if (!await IsValidOrCanRenewAppToken()) return false;
-                
-                if (!await IsValidOrCanRenewSessionToken()) return false;
-               
-                _appInfo.SetJwtAuthenticationCredentials(null, _credentials.AppToken, DateTime.Now < _credentials.SessionTokenExpirationDate ? _credentials.SessionToken : null);
-                if (RestoredSession != null)
-                    await RestoredSession.Invoke().ConfigureAwait(false);
+                if (storedCredentials?.CanRead() != true) return false; // couldn't parse
+                _credentialStore.MergeTokensFrom(storedCredentials);
                 return true;
             }
-            // else, it's expired, need new credentials
-            else
+            finally
             {
-                return false;
+                // TODO: Is this really needed? We probably want to wait for it in all cases
+                if (RestoredSession != null)
+                    await RestoredSession.Invoke().ConfigureAwait(false);
             }
         }
-        private Task SaveAndSetCredentials(JwtTokenResponse response)
+        private async Task MergeAndSaveCredentialsAsync(JwtTokenResponse response)
         {
-            _credentials = response;
-
-            _appInfo.SetJwtAuthenticationCredentials(_credentials.ElevatedToken, _credentials.AppToken, _credentials.SessionToken);
-
-            if (_isTemporaryOnly /* for elevated login, do not load or save */)
-                return Task.CompletedTask;
-
-            return SettingsManager.TrySavingJson(response.WithoutElevatedToken(), "___adt", CompressionAlgorithm.GZip);
+            _credentialStore.MergeTokensFrom(response);
+            HasPendingToPersistTokens |=
+                !await SettingsManager.TrySavingJson(_credentialStore.WithoutElevatedToken(), "___adt",
+                    CompressionAlgorithm.GZip);
         }
-        private async Task MergeAndSetCredentials(JwtTokenResponse response)
-        {
-            _credentials ??= new JwtTokenResponse();
-            _credentials.ElevatedToken = response.ElevatedToken ?? _credentials.ElevatedToken;
-            _credentials.ElevatedTokenExpirationDate = response.ElevatedTokenExpirationDate ?? _credentials.ElevatedTokenExpirationDate;
-            // ReSharper disable once NullCoalescingConditionIsAlwaysNotNullAccordingToAPIContract
-            _credentials.AppToken = response.AppToken ?? _credentials.AppToken;
-            _credentials.AppTokenExpirationDate = response.AppTokenExpirationDate ?? _credentials.AppTokenExpirationDate;
-            _credentials.SessionToken = response.SessionToken ?? _credentials.SessionToken;
-            _credentials.SessionTokenExpirationDate = response.SessionTokenExpirationDate ?? _credentials.SessionTokenExpirationDate;
-
-            _appInfo.SetJwtAuthenticationCredentials(_credentials.ElevatedToken, _credentials.AppToken, _credentials.SessionToken);
-
-            if (_isTemporaryOnly /* for elevated login, do not load or save */)
-                return;
-
-            // if the user didn't set "RememberMe", it would force him to remember him
-            // check if the token had been saved, if not, don't save it here either
-            if (await SettingsManager.ExistsAsync("___adt") != FilePresence.Found)
-                return;
-
-            await SettingsManager.TrySavingJson(response.WithoutElevatedToken(), "___adt", CompressionAlgorithm.GZip);
-        }
-        public async Task<AuthRequestCreated?> CreateAuthRequest(string appName)
+        public async Task<AuthRequestCreated?> CreateAuthRequestAsync(string appName)
         {
             using var request = _appInfo.PostHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/request/create"),
                        new AuthRequestCreation(appName: appName));
             var response = await Web.ResolveRequestAsRestResponse<AuthRequestCreated>(_appInfo.HttpClient, request)
                     .ConfigureAwait(false);
-            switch (response.Status)
+            return response.Status switch
             {
 #if WINDOWS_UWP
-                case HttpStatusCode.Ok:
+                HttpStatusCode.Ok => response.Result,
 #else
-                case HttpStatusCode.OK:
+                HttpStatusCode.OK => response.Result,
 #endif
-                    return response.Result;
-                default:
-                    return null;
-            }
-            
+                _ => null,
+            };
         }
 
-        public async Task<AuthRequestChecked?> CheckAuthRequest(AuthRequestCreated created)
+        public async Task<AuthRequestChecked?> CheckAuthRequestAsync(AuthRequestCreated created)
         {
             using var request = _appInfo.PostHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/request/check"),
                        new AuthRequestCheck(requestId: created.RequestId, checkKey: created.CheckKey));
             var response = await Web.ResolveRequestAsRestResponse<AuthRequestChecked>(_appInfo.HttpClient, request)
                     .ConfigureAwait(false);
-            switch (response.Status)
-                {
+            return response.Status switch
+            {
 #if WINDOWS_UWP
-                    case HttpStatusCode.Ok:
+                HttpStatusCode.Ok => response.Result,
 #else
-                    case HttpStatusCode.OK:
+                HttpStatusCode.OK => response.Result,
 #endif
-                        return response.Result;
-                    default:
-                        return null;
-                }
-            
+                _ => null,
+            };
         }
 
-        public async Task<bool?> CompleteAuthRequest(AuthRequestCreated created)
+        public async Task<AuthOperationResult> CompleteAuthRequestAsync(AuthRequestCreated created)
         {
             using var request = _appInfo.PostHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/request/complete"),
                 new AuthRequestCompletion(requestId: created.RequestId, requestKey: created.RequestKey));
             var response = await Web.ResolveRequestAsRestResponse<AuthRequestCompleted>(_appInfo.HttpClient, request)
                 .ConfigureAwait(false);
 #if WINDOWS_UWP
-            if (response is { Status: HttpStatusCode.Ok, Result: { } })
+            if (response is not { Status: HttpStatusCode.Ok, Result: not null })
 #else
-            if (response is { Status: HttpStatusCode.OK, Result: { } })
+            if (response is not { Status: HttpStatusCode.OK, Result: not null })
 #endif
-            {
-                var authResponse = JsonConvert.DeserializeObject<JwtTokenResponse>(response.Result.Token);
-                if (authResponse == null) return false;
-                _appInfo.SetJwtAuthenticationCredentials(authResponse.ElevatedToken, authResponse.AppToken,
-                    authResponse.SessionToken);
-                _credentials = authResponse;
-                await SaveAndSetCredentials(response: authResponse).ConfigureAwait(false);
-                if (LoggedIn != null)
-                    await LoggedIn.Invoke().ConfigureAwait(false);
-                return true;
-            }
-            if (response.Status is HttpStatusCode.Conflict)
-            {
-                return false;
-            }
-
-            return null;
+                return response.Status == HttpStatusCode.Conflict ? AuthOperationResult.Unauthorized : AuthOperationResult.ErrorCannotDetermine;
+            var authResponse = JsonConvert.DeserializeObject<JwtTokenResponse>(response.Result.Token);
+            if (authResponse?.CanRead() != true) return AuthOperationResult.Unauthorized;
+            await MergeAndSaveCredentialsAsync(authResponse);
+            if (LoggedIn != null)
+                await LoggedIn.Invoke().ConfigureAwait(false);
+            return AuthOperationResult.Success;
         }
 
-        public async Task<bool> TryLoggingInWithDeviceAsync(long deviceId)
+        public async Task<AuthOperationResult> LogInWithDeviceAsync(long deviceId)
         {
             if (_appInfo.AuthenticationTypeSet == AuthenticationType.None)
-                return false; // not logged in
-
-            var deviceInfo = new DeviceTokenRequest(deviceId: deviceId);
-
-            using var request =
-                   _appInfo.PostAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/device-token"), deviceInfo,
-                       JwtTokenKind.App);
+                return AuthOperationResult.Unauthorized; // not logged in
+            try
+            {
+                var deviceInfo = new DeviceTokenRequest(deviceId: deviceId);
+                using var request =
+                    _appInfo.PostAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/device-token"), deviceInfo,
+                        JwtTokenKind.App);
                 var response = await Web.ResolveRequestAsRestResponse<JwtTokenResponse>(_appInfo.HttpClient, request)
                     .ConfigureAwait(false);
 #if WINDOWS_UWP
-                if (response is { Status: HttpStatusCode.Ok, Result: { } })
+                if (response is { Status: HttpStatusCode.Ok, Result: not null })
 #else
-                if (response is { Status: HttpStatusCode.OK, Result: { } })
+                if (response is not { Status: HttpStatusCode.OK, Result: not null }) 
 #endif
-                {
-                    await MergeAndSetCredentials(response.Result).ConfigureAwait(false);
-                    return true;
-                }
-                else
-                {
-                    return false;
-                }
+                    return AuthOperationResult.Unauthorized;
+                if (response.Result.CanRead() != true) return AuthOperationResult.ErrorCannotDetermine;
+                await MergeAndSaveCredentialsAsync(response.Result).ConfigureAwait(false);
+                return AuthOperationResult.Success;
+            }
+            catch (Exception ex)
+            {
+                Log.Debug(ex, "Failed to log in with device");
+                return AuthOperationResult.ErrorCannotDetermine;
+            }
         }
-        public async Task<bool?> RenewCredentials(JwtTokenKind jwtTokenKind)
+        public async Task<AuthOperationResult> RenewMainTokenAsync(bool permissionsChanged = false)
         {
-            using var request = _appInfo.GetAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/renew-token"), jwtTokenKind);
+            var mainToken = GetMainToken();
+            if (mainToken == null) return AuthOperationResult.Unauthorized;
+            using var request = _appInfo.GetAuthenticatedHttpRequestTo(new Uri(permissionsChanged ? $"{_appInfo.ApiUrl}/auth/permissions-changed-renew-token" : $"{_appInfo.ApiUrl}/auth/renew-token"), mainToken.Kind);
+            var response = await Web.ResolveRequestAsRestResponse<JwtTokenResponse>(_appInfo.HttpClient, request).ConfigureAwait(false);
+#if WINDOWS_UWP
+            if (response is { Status: HttpStatusCode.Ok, Result: not null })
+#else
+            if (response is { Status: HttpStatusCode.OK, Result: not null })
+#endif
+            {
+                // TODO: didn't check if could read before merge?
+                await MergeAndSaveCredentialsAsync(response.Result).ConfigureAwait(false);
+                return AuthOperationResult.Success;
+            }
 
+            return response.Status switch
+            {
+                HttpStatusCode.Unauthorized => AuthOperationResult.Unauthorized,
+                HttpStatusCode.BadRequest => AuthOperationResult.NoOp,
+                _ => AuthOperationResult.ErrorCannotDetermine,
+            };
+        }
+        public async Task<AuthOperationResult> GetNewSessionTokenAsync()
+        {
+            var mainToken = GetMainToken();
+            if (mainToken == null) return AuthOperationResult.Unauthorized;
+            using var request = _appInfo.GetAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/new-session-token"), mainToken.Kind);
             var response = await Web.ResolveRequestAsRestResponse<JwtTokenResponse>(_appInfo.HttpClient, request)
                 .ConfigureAwait(false);
-            
 #if WINDOWS_UWP
-            if (response is { Status: HttpStatusCode.Ok, Result: { } })
+            if (response is { Status: HttpStatusCode.Ok, Result: not null })
 #else
-            if (response is { Status: HttpStatusCode.OK, Result: { } })
+            if (response is { Status: HttpStatusCode.OK, Result: not null })
 #endif
             {
-                await MergeAndSetCredentials(response.Result).ConfigureAwait(false);
-                return true;
+                // TODO: Didn't try parse?
+                await MergeAndSaveCredentialsAsync(response.Result).ConfigureAwait(false);
+                return AuthOperationResult.Success;
             }
-            if (response.Status is HttpStatusCode.Unauthorized or HttpStatusCode.BadRequest)
+            return response.Status switch
             {
-                return false;
-            }
-            return null;
+                HttpStatusCode.Unauthorized => AuthOperationResult.Unauthorized,
+                HttpStatusCode.BadRequest => AuthOperationResult.NoOp,
+                _ => AuthOperationResult.ErrorCannotDetermine,
+            };
         }
-        public async Task<bool?> GetNewSessionToken()
+        public async Task<AuthOperationResult> LogOutAsync()
         {
-            if (_credentials == null) return false;
-            using var request = _appInfo.GetAuthenticatedHttpRequestTo(
-                new Uri($"{_appInfo.ApiUrl}/auth/new-session-token"),
-                // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
-                _credentials.AppToken != null ? JwtTokenKind.App : JwtTokenKind.Elevated);
-      
-            var response = await Web.ResolveRequestAsRestResponse<JwtTokenResponse>(_appInfo.HttpClient, request)
-                .ConfigureAwait(false);
-
-            if (response.Status is HttpStatusCode.Unauthorized or HttpStatusCode.BadRequest)
-            {
-                return false;
-            }
-#if WINDOWS_UWP
-            if (response is { Status: HttpStatusCode.Ok, Result: { } })
-#else
-            if (response is { Status: HttpStatusCode.OK, Result: { } })
-#endif
-            {
-                await MergeAndSetCredentials(response.Result).ConfigureAwait(false);
-                return true;
-            }
-            return null; // need to retry, but we can trust cache, possibly we need to add a check to see if cache is expired?
-        }
-        public async Task<bool?> PermissionsChangedRenewCredentials(JwtTokenKind jwtTokenKind)
-        {
-            using var request =
-                _appInfo.GetAuthenticatedHttpRequestTo(
-                    new Uri($"{_appInfo.ApiUrl}/auth/permissions-changed-renew-token"), jwtTokenKind);
-            var response = await Web.ResolveRequestAsRestResponse<JwtTokenResponse>(_appInfo.HttpClient, request);
-
-#if WINDOWS_UWP
-            if (response is { Status: HttpStatusCode.Ok, Result: { } })
-#else
-            if (response is { Status: HttpStatusCode.OK, Result: { } })
-#endif
-            {
-                await MergeAndSetCredentials(response.Result).ConfigureAwait(false);
-                return true;
-            }
-            // appToken has newest permissions, while sessionToken has old permissions, request a new session token instead!
-            if (response.Status is HttpStatusCode.Unauthorized or HttpStatusCode.BadRequest)
-            {
-                return await GetNewSessionToken();
-            }
-            return false;
-        }
-        public async Task<bool> TryLoggingOut()
-        {
+            // TODO: We should set up in the API a relation, so if either the elevated or the app token is sent, both work for logout, and logging out from one, logs out from both
+            if (_appInfo.AuthenticationTypeSet == AuthenticationType.None) return AuthOperationResult.Unauthorized; // not logged in
+            var mainToken = GetMainToken();
+            if (mainToken == null) return AuthOperationResult.Unauthorized;
             using var request = _appInfo.GetAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/logout"));
-            var response = await Web.ResolveRequestAsRestResponse(_appInfo.HttpClient, request).ConfigureAwait(false);
-#if WINDOWS_UWP
-            if (response.Status is HttpStatusCode.Ok or HttpStatusCode.Unauthorized)
-#else
-            if (response.Status is HttpStatusCode.OK or HttpStatusCode.Unauthorized)
-#endif
-            {
-                await _appInfo.ClearAuthenticationCredentials().ConfigureAwait(false);
-                _credentials = null; // clear this cache
-                if (LoggedOut != null)
-                    await LoggedOut.Invoke().ConfigureAwait(false);
-                return true;
-            }
-
-            return false;
-        }
-        public async Task<bool?> ValidateOrRenewSession()
-        {
-            // not logged in
-            if (_appInfo.AuthenticationTypeSet == AuthenticationType.None)
-                return false;
-
-            if (_appInfo.IsExpiredSession)
-            {
-                var gotNewSessionToken = await GetNewSessionToken();
-                if (gotNewSessionToken == false)
-                {
-                    await _appInfo.ClearAuthenticationCredentials().ConfigureAwait(false);
-                    return false;
-                }
-                return gotNewSessionToken;
-            }
-
-            // check if session is still valid, since if it's not near renewal, it regularly won't revalidate it
-            using var request =
-                _appInfo.GetAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/validate-session"));
             var response = await Web.ResolveRequestAsRestResponse(_appInfo.HttpClient, request)
                 .ConfigureAwait(false);
-            if (response.Status == HttpStatusCode.Unauthorized || response.Status == HttpStatusCode.BadRequest)
+            await _appInfo.ClearAuthenticationCredentials(deletePersistedCredentials: true);
+            if (LoggedOut != null)
+                await LoggedOut.Invoke().ConfigureAwait(false);
+            return response.Status switch
             {
-                // retry getting a new token
-                if (await GetNewSessionToken() ==
-                    false) // NOTE: This clears the authentication credentials files TWICE
-                {
-                    await _appInfo.ClearAuthenticationCredentials().ConfigureAwait(false);
-                    return false;
-                }
-            }
 #if WINDOWS_UWP
-            else if (response.Status == HttpStatusCode.Ok)
+                HttpStatusCode.Ok => AuthOperationResult.Success,
 #else
-            else if (response.Status == HttpStatusCode.OK)
+                HttpStatusCode.OK => AuthOperationResult.Success,
 #endif
-            {
-                return true;
-            }
+                HttpStatusCode.Unauthorized => AuthOperationResult.Unauthorized | AuthOperationResult.NoOp,
+                _ => AuthOperationResult.ErrorCannotDetermine,
+            };
+        }
 
-            return null; // need to retry, but we can trust cache
+        public async Task<AuthOperationResult> ValidateTokenAsync(JwtTokenKind kind)
+        {
+            if (_appInfo.AuthenticationTypeSet == AuthenticationType.None)
+                return AuthOperationResult.Unauthorized; // not logged in
+            using var request = _appInfo.GetAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/validate-token"), kind);
+            var response = await Web.ResolveRequestAsRestResponse(_appInfo.HttpClient, request).ConfigureAwait(false);
+            if (response.Status is HttpStatusCode.Unauthorized) _credentialStore.GetToken(kind)?.FlagForRenewal();
+            return response.Status switch
+            {
+#if WINDOWS_UWP
+                HttpStatusCode.Ok => AuthOperationResult.Success,
+#else
+                HttpStatusCode.OK => AuthOperationResult.Success,
+#endif
+                HttpStatusCode.Unauthorized => AuthOperationResult.Unauthorized,
+                _ => AuthOperationResult.ErrorCannotDetermine,
+            };
         }
     }
 }
