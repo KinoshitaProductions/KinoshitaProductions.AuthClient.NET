@@ -2,7 +2,6 @@
 using Windows.Web.Http;
 #else
 using System.Net;
-using KinoshitaProductions.AuthClient.Enums;
 #endif
 using KinoshitaProductions.Common.Interfaces.AppInfo;
 using KinoshitaProductions.Common.Services;
