@@ -26,7 +26,7 @@
   </ImportGroup>
 
   <ItemGroup>
-    <PackageReference Include="KinoshitaProductions.Common" Version="1.0.7" />
+    <PackageReference Include="KinoshitaProductions.Common" Version="1.0.8" />
     <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.0.1" />
   </ItemGroup>
 

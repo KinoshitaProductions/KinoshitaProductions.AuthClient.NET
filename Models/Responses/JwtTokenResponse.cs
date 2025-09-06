@@ -1,7 +1,6 @@
 ﻿using System.IdentityModel.Tokens.Jwt;
 using KinoshitaProductions.Common.Enums;
 using KinoshitaProductions.Common.Interfaces.AppInfo;
-using Serilog;
 
 namespace KinoshitaProductions.AuthClient.Models.Responses;
 
@@ -34,12 +33,12 @@ internal sealed class Token
             };
             if (kind == JwtTokenKind.NotSpecified)
                 return null;
-            return tokenCache = new Token(kind, parsedToken.IssuedAt, parsedToken.ValidTo);
+            return tokenCache = new Token(kind, parsedToken.IssuedAt, parsedToken.ValidTo == DateTime.MinValue ? DateTime.MaxValue : parsedToken.ValidTo);
         } finally {
             if (tokenCache == null) jwtToken = null;
         }
     }
-    internal Token(JwtTokenKind kind, DateTime issuedAt, DateTime expirationDate)
+    private Token(JwtTokenKind kind, DateTime issuedAt, DateTime expirationDate)
     {
         Kind = kind;
         IssuedAt = issuedAt;
@@ -48,24 +47,25 @@ internal sealed class Token
     internal JwtTokenKind Kind { get; }
    // private JwtSecurityToken? _parsedValue;
     //internal JwtSecurityToken ParsedValue => _parsedValue ??= new JwtSecurityTokenHandler().ReadJwtToken(Value); // TODO: Must ensure we catch this, ideally when reading tokens
-    internal DateTime IssuedAt { get; }
-    internal DateTime ExpirationDate { get; }
+    private DateTime IssuedAt { get; }
+    private DateTime ExpirationDate { get; }
 
     private TimeSpan Age => DateTime.UtcNow - IssuedAt;
     private TimeSpan StillValidFor => ExpirationDate - DateTime.UtcNow;
-    internal bool IsValid => ExpirationDate > DateTime.UtcNow;
-    internal bool ShouldConsiderRenewal => _needsRenewal || Age > TimeSpan.FromDays(7) || StillValidFor < TimeSpan.FromDays(7);
+    private bool _isInvalid;
+    internal bool IsValid => !_isInvalid && ExpirationDate > DateTime.UtcNow;
+    internal bool NeedsRenewal => _needsRenewal || Age > TimeSpan.FromDays(3) || StillValidFor < TimeSpan.FromDays(7);
     private bool _needsRenewal;
-    internal void FlagForRenewal()
+    internal void FlagForRenewal(bool needsRenewal, bool isInvalid = false)
     {
-        _needsRenewal = true;
+        _needsRenewal = needsRenewal;
+        _isInvalid = isInvalid;
     }
 }
 
 internal class JwtCredentialsStore
 {    
     private IJwtAuthenticatedServiceAppInfo? _appInfo;
-    public JwtCredentialsStore() {}
     public void LinkToAppInfo(IJwtAuthenticatedServiceAppInfo appInfo)
     {
         _appInfo = appInfo;
@@ -132,6 +132,16 @@ internal class JwtCredentialsStore
         GetToken(JwtTokenKind.App);
         GetToken(JwtTokenKind.Session);
         return this;
+    }
+
+    public void Clear()
+    {
+        _elevatedToken = null;
+        _elevatedTokenCache = null;
+        _appToken = null;
+        _appTokenCache = null;
+        _sessionToken = null;
+        _sessionTokenCache = null;
     }
 }
 // currently these two share the scheme for JSON fully

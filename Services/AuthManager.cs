@@ -17,16 +17,18 @@ namespace KinoshitaProductions.AuthClient.Services
     // ReSharper disable once ClassNeverInstantiated.Global
     public sealed class AuthManager
     {
-        private static JwtTokenKind[] allTokenKinds = new[] { JwtTokenKind.Elevated, JwtTokenKind.App, JwtTokenKind.Session };
+        private static readonly JwtTokenKind[] AllTokenKinds = { JwtTokenKind.Elevated, JwtTokenKind.App, JwtTokenKind.Session };
         //private JwtTokenKind forcingTokensRenewal;
         public void FlagForRenewal(JwtTokenKind tokenKinds)
         {
-            foreach (var tokenKind in allTokenKinds.Where(tokenKind => tokenKinds.HasFlag(tokenKind)))
-                _credentialStore.GetToken(tokenKind)?.FlagForRenewal();
+            if (tokenKinds.HasFlag(JwtTokenKind.Elevated))
+                throw new ArgumentException("renewing an elevated token is disallowed for security reasons");
+            foreach (var tokenKind in AllTokenKinds)
+                _credentialStore.GetToken(tokenKind)?.FlagForRenewal(tokenKinds.HasFlag(tokenKind));
         }
         public bool HasPendingToPersistTokens { get; private set; }
         public bool HasElevatedPermissions => _credentialStore.HasToken(JwtTokenKind.Elevated);
-        private readonly JwtCredentialsStore _credentialStore;
+        private readonly JwtCredentialsStore _credentialStore = new ();
         private readonly IJwtAuthenticatedServiceAppInfo _appInfo;
 
         public event Func<Task>? LoggedIn;
@@ -36,7 +38,6 @@ namespace KinoshitaProductions.AuthClient.Services
         public AuthManager(IJwtAuthenticatedServiceAppInfo appInfo)
         {
             _appInfo = appInfo;
-            _credentialStore = new JwtCredentialsStore();
             _credentialStore.LinkToAppInfo(_appInfo);
         }
         public bool ScheduledToPersistAnyChanges() => HasPendingToPersistTokens;
@@ -47,16 +48,29 @@ namespace KinoshitaProductions.AuthClient.Services
                     CompressionAlgorithm.GZip);
         }
         //private Token? GetMainToken() => new [] { _credentialStore.GetToken(JwtTokenKind.App), _credentialStore.GetToken(JwtTokenKind.Elevated) }.FirstOrDefault(x => x?.IsValid == true);
-        public bool ScheduledToRenewAnyToken() => _credentialStore.GetToken(JwtTokenKind.App)?.ShouldConsiderRenewal == true ||
-                                             _credentialStore.GetToken(JwtTokenKind.Session)?.ShouldConsiderRenewal == true;
-        public async Task<AuthOperationResult> RenewTokensAsync()
+        public bool ScheduledToRenewAnyToken() => _credentialStore.GetToken(JwtTokenKind.App)?.NeedsRenewal == true ||
+                                             _credentialStore.GetToken(JwtTokenKind.Session)?.NeedsRenewal == true;
+        public async Task<AuthOperationResult> RenewTokensAsync(bool permissionsChanged = false)
         {
-            if (_credentialStore.GetToken(JwtTokenKind.App)?.ShouldConsiderRenewal == true)
-                return await RenewMainTokenAsync();
-            if (_credentialStore.GetToken(JwtTokenKind.Session)?.ShouldConsiderRenewal == true)
-                return await GetNewSessionTokenAsync();
+            var renewalToken = GetRenewalToken();
+            var sessionToken = _credentialStore.GetToken(JwtTokenKind.Session);
+            if (renewalToken == null && sessionToken?.IsValid != true) return AuthOperationResult.Unauthorized; // no valid tokens available
+            if (renewalToken == null) return AuthOperationResult.NoOp; // without a renewalToken, the only option is for the session token to expire
+            if (renewalToken.NeedsRenewal || permissionsChanged)
+                return await RenewTokenAsync(renewalToken, renewalToken.Kind, permissionsChanged);
+            if (sessionToken == null || sessionToken.NeedsRenewal)
+                return await RenewTokenAsync(renewalToken, JwtTokenKind.Session);
             return AuthOperationResult.NoOp;
         }
+
+        private Token? GetRenewalToken()
+        {
+            var token = _credentialStore.GetToken(JwtTokenKind.App);
+            if (token?.IsValid == true) return token;
+            token = _credentialStore.GetToken(JwtTokenKind.Elevated);
+            return token?.IsValid == true ? token : null;
+        }
+        
         /// <summary>
         /// On app initialization, this should be called to load the credentials if possible.
         /// </summary>
@@ -167,11 +181,9 @@ namespace KinoshitaProductions.AuthClient.Services
                 return AuthOperationResult.ErrorCannotDetermine;
             }
         }
-        public async Task<AuthOperationResult> RenewMainTokenAsync(bool permissionsChanged = false)
+        private async Task<AuthOperationResult> RenewTokenAsync(Token renewalToken, JwtTokenKind tokenKindToRenew, bool permissionsChanged = false)
         {
-            var mainToken = _credentialStore.GetToken(JwtTokenKind.App);
-            if (mainToken == null) return AuthOperationResult.Unauthorized;
-            using var request = _appInfo.GetAuthenticatedHttpRequestTo(new Uri(permissionsChanged ? $"{_appInfo.ApiUrl}/auth/permissions-changed-renew-token" : $"{_appInfo.ApiUrl}/auth/renew-token"), mainToken.Kind);
+            using var request = _appInfo.GetAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}{(permissionsChanged ? "/auth/permissions-changed-renew-token" : tokenKindToRenew == JwtTokenKind.Session ? "/auth/new-session-token" : "/auth/renew-token")}"), renewalToken.Kind);
             var response = await Web.ResolveRequestAsRestResponse<JwtTokenResponse>(_appInfo.HttpClient, request).ConfigureAwait(false);
 #if WINDOWS_UWP
             if (response is { Status: HttpStatusCode.Ok, Result: not null })
@@ -191,38 +203,19 @@ namespace KinoshitaProductions.AuthClient.Services
                 _ => AuthOperationResult.ErrorCannotDetermine,
             };
         }
-        public async Task<AuthOperationResult> GetNewSessionTokenAsync()
-        {
-            var mainToken = _credentialStore.GetToken(JwtTokenKind.App);
-            if (mainToken == null) return AuthOperationResult.Unauthorized;
-            using var request = _appInfo.GetAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/new-session-token"), mainToken.Kind);
-            var response = await Web.ResolveRequestAsRestResponse<JwtTokenResponse>(_appInfo.HttpClient, request)
-                .ConfigureAwait(false);
-#if WINDOWS_UWP
-            if (response is { Status: HttpStatusCode.Ok, Result: not null })
-#else
-            if (response is { Status: HttpStatusCode.OK, Result: not null })
-#endif
-            {
-                // TODO: Didn't try parse?
-                await MergeAndSaveCredentialsAsync(response.Result).ConfigureAwait(false);
-                return AuthOperationResult.Success;
-            }
-            return response.Status switch
-            {
-                HttpStatusCode.Unauthorized => AuthOperationResult.Unauthorized,
-                HttpStatusCode.BadRequest => AuthOperationResult.NoOp,
-                _ => AuthOperationResult.ErrorCannotDetermine,
-            };
-        }
-        
         public async Task<AuthOperationResult> LogOutAsync()
         {
             // TODO: We should set up in the API a relation, so if either the elevated or the app token is sent, both work for logout, and logging out from one, logs out from both
             if (_appInfo.AuthenticationTypeSet == AuthenticationType.None) return AuthOperationResult.Unauthorized; // not logged in
             try
             {
-                HttpStatusCode status = HttpStatusCode.OK;
+                HttpStatusCode status = 
+#if WINDOWS_UWP
+                        HttpStatusCode.Ok
+#else
+                        HttpStatusCode.OK
+#endif
+                        ;
                 foreach (var token in new[]
                          {
                              _credentialStore.GetToken(JwtTokenKind.Elevated),
@@ -231,10 +224,16 @@ namespace KinoshitaProductions.AuthClient.Services
                 {
                     if (token == null) return AuthOperationResult.Unauthorized;
                     using var request =
-                        _appInfo.GetAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/logout"));
+                        _appInfo.GetAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/logout"), token.Kind);
                     var response = await Web.ResolveRequestAsRestResponse(_appInfo.HttpClient, request)
                         .ConfigureAwait(false);
-                    if (response.Status > 0 && response.Status != HttpStatusCode.OK) status = response.Status;
+                    if (response.Status > 0 && response.Status != 
+#if WINDOWS_UWP
+                        HttpStatusCode.Ok
+#else
+                        HttpStatusCode.OK
+#endif
+                        ) status = response.Status;
                 }
 
                 return status switch
@@ -250,6 +249,7 @@ namespace KinoshitaProductions.AuthClient.Services
             }
             finally
             {
+                _credentialStore.Clear();
                 await _appInfo.ClearAuthenticationCredentials(deletePersistedCredentials: true);
                 if (LoggedOut != null)
                     await LoggedOut.Invoke().ConfigureAwait(false);
@@ -258,11 +258,11 @@ namespace KinoshitaProductions.AuthClient.Services
 
         public async Task<AuthOperationResult> ValidateTokenAsync(JwtTokenKind kind)
         {
-            if (_appInfo.AuthenticationTypeSet == AuthenticationType.None)
+            if (_appInfo.AuthenticationTypeSet == AuthenticationType.None || _credentialStore.GetToken(kind)?.IsValid != true)
                 return AuthOperationResult.Unauthorized; // not logged in
             using var request = _appInfo.GetAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/validate-token"), kind);
             var response = await Web.ResolveRequestAsRestResponse(_appInfo.HttpClient, request).ConfigureAwait(false);
-            if (response.Status is HttpStatusCode.Unauthorized) _credentialStore.GetToken(kind)?.FlagForRenewal();
+            if (response.Status is HttpStatusCode.Unauthorized) _credentialStore.GetToken(kind)?.FlagForRenewal(true, isInvalid: true);
             return response.Status switch
             {
 #if WINDOWS_UWP
