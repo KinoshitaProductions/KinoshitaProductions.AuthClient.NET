@@ -17,9 +17,16 @@ namespace KinoshitaProductions.AuthClient.Services
     // ReSharper disable once ClassNeverInstantiated.Global
     public sealed class AuthManager
     {
+        private static JwtTokenKind[] allTokenKinds = new[] { JwtTokenKind.Elevated, JwtTokenKind.App, JwtTokenKind.Session };
+        //private JwtTokenKind forcingTokensRenewal;
+        public void FlagForRenewal(JwtTokenKind tokenKinds)
+        {
+            foreach (var tokenKind in allTokenKinds.Where(tokenKind => tokenKinds.HasFlag(tokenKind)))
+                _credentialStore.GetToken(tokenKind)?.FlagForRenewal();
+        }
         public bool HasPendingToPersistTokens { get; private set; }
         public bool HasElevatedPermissions => _credentialStore.HasToken(JwtTokenKind.Elevated);
-        private readonly JwtTokenResponse _credentialStore;
+        private readonly JwtCredentialsStore _credentialStore;
         private readonly IJwtAuthenticatedServiceAppInfo _appInfo;
 
         public event Func<Task>? LoggedIn;
@@ -29,21 +36,22 @@ namespace KinoshitaProductions.AuthClient.Services
         public AuthManager(IJwtAuthenticatedServiceAppInfo appInfo)
         {
             _appInfo = appInfo;
-            _credentialStore = new JwtTokenResponse(_appInfo);
+            _credentialStore = new JwtCredentialsStore();
+            _credentialStore.LinkToAppInfo(_appInfo);
         }
         public bool ScheduledToPersistAnyChanges() => HasPendingToPersistTokens;
         public async Task PersistChangesAsync()
         {
             HasPendingToPersistTokens |=
-                !await SettingsManager.TrySavingJson(_credentialStore.WithoutElevatedToken(), "___adt",
+                !await SettingsManager.TrySavingJson(_credentialStore.WithoutElevatedTokenForStoring(), "___adt",
                     CompressionAlgorithm.GZip);
         }
-        private Token? GetMainToken() => new [] { _credentialStore.GetToken(JwtTokenKind.App), _credentialStore.GetToken(JwtTokenKind.Elevated) }.FirstOrDefault(x => x?.IsValid == true);
-        public bool ScheduledToRenewAnyToken() => GetMainToken()?.ShouldConsiderRenewal == true ||
+        //private Token? GetMainToken() => new [] { _credentialStore.GetToken(JwtTokenKind.App), _credentialStore.GetToken(JwtTokenKind.Elevated) }.FirstOrDefault(x => x?.IsValid == true);
+        public bool ScheduledToRenewAnyToken() => _credentialStore.GetToken(JwtTokenKind.App)?.ShouldConsiderRenewal == true ||
                                              _credentialStore.GetToken(JwtTokenKind.Session)?.ShouldConsiderRenewal == true;
         public async Task<AuthOperationResult> RenewTokensAsync()
         {
-            if (GetMainToken()?.ShouldConsiderRenewal == true)
+            if (_credentialStore.GetToken(JwtTokenKind.App)?.ShouldConsiderRenewal == true)
                 return await RenewMainTokenAsync();
             if (_credentialStore.GetToken(JwtTokenKind.Session)?.ShouldConsiderRenewal == true)
                 return await GetNewSessionTokenAsync();
@@ -60,8 +68,8 @@ namespace KinoshitaProductions.AuthClient.Services
             var storedCredentials = await SettingsManager.TryLoadingJson<JwtTokenResponse>("___adt", filePresence, CompressionAlgorithm.GZip).ConfigureAwait(false);
             try
             {
-                if (storedCredentials?.CanRead() != true) return false; // couldn't parse
-                _credentialStore.MergeTokensFrom(storedCredentials);
+                if (storedCredentials == null) return false; // couldn't parse
+                _credentialStore.MergeTokensFrom(storedCredentials.Sanitize());
                 return true;
             }
             finally
@@ -72,9 +80,9 @@ namespace KinoshitaProductions.AuthClient.Services
         }
         private async Task MergeAndSaveCredentialsAsync(JwtTokenResponse response)
         {
-            _credentialStore.MergeTokensFrom(response);
+            _credentialStore.MergeTokensFrom(response.Sanitize());
             HasPendingToPersistTokens |=
-                !await SettingsManager.TrySavingJson(_credentialStore.WithoutElevatedToken(), "___adt",
+                !await SettingsManager.TrySavingJson(_credentialStore.WithoutElevatedTokenForStoring(), "___adt",
                     CompressionAlgorithm.GZip);
         }
         public async Task<AuthRequestCreated?> CreateAuthRequestAsync(string appName)
@@ -124,7 +132,7 @@ namespace KinoshitaProductions.AuthClient.Services
 #endif
                 return response.Status == HttpStatusCode.Conflict ? AuthOperationResult.Unauthorized : AuthOperationResult.ErrorCannotDetermine;
             var authResponse = JsonConvert.DeserializeObject<JwtTokenResponse>(response.Result.Token);
-            if (authResponse?.CanRead() != true) return AuthOperationResult.Unauthorized;
+            if (authResponse == null) return AuthOperationResult.ErrorCannotDetermine;
             await MergeAndSaveCredentialsAsync(authResponse);
             if (LoggedIn != null)
                 await LoggedIn.Invoke().ConfigureAwait(false);
@@ -149,7 +157,7 @@ namespace KinoshitaProductions.AuthClient.Services
                 if (response is not { Status: HttpStatusCode.OK, Result: not null }) 
 #endif
                     return AuthOperationResult.Unauthorized;
-                if (response.Result.CanRead() != true) return AuthOperationResult.ErrorCannotDetermine;
+                if (response.Result == null) return AuthOperationResult.ErrorCannotDetermine;
                 await MergeAndSaveCredentialsAsync(response.Result).ConfigureAwait(false);
                 return AuthOperationResult.Success;
             }
@@ -161,7 +169,7 @@ namespace KinoshitaProductions.AuthClient.Services
         }
         public async Task<AuthOperationResult> RenewMainTokenAsync(bool permissionsChanged = false)
         {
-            var mainToken = GetMainToken();
+            var mainToken = _credentialStore.GetToken(JwtTokenKind.App);
             if (mainToken == null) return AuthOperationResult.Unauthorized;
             using var request = _appInfo.GetAuthenticatedHttpRequestTo(new Uri(permissionsChanged ? $"{_appInfo.ApiUrl}/auth/permissions-changed-renew-token" : $"{_appInfo.ApiUrl}/auth/renew-token"), mainToken.Kind);
             var response = await Web.ResolveRequestAsRestResponse<JwtTokenResponse>(_appInfo.HttpClient, request).ConfigureAwait(false);
@@ -185,7 +193,7 @@ namespace KinoshitaProductions.AuthClient.Services
         }
         public async Task<AuthOperationResult> GetNewSessionTokenAsync()
         {
-            var mainToken = GetMainToken();
+            var mainToken = _credentialStore.GetToken(JwtTokenKind.App);
             if (mainToken == null) return AuthOperationResult.Unauthorized;
             using var request = _appInfo.GetAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/new-session-token"), mainToken.Kind);
             var response = await Web.ResolveRequestAsRestResponse<JwtTokenResponse>(_appInfo.HttpClient, request)
@@ -207,28 +215,45 @@ namespace KinoshitaProductions.AuthClient.Services
                 _ => AuthOperationResult.ErrorCannotDetermine,
             };
         }
+        
         public async Task<AuthOperationResult> LogOutAsync()
         {
             // TODO: We should set up in the API a relation, so if either the elevated or the app token is sent, both work for logout, and logging out from one, logs out from both
             if (_appInfo.AuthenticationTypeSet == AuthenticationType.None) return AuthOperationResult.Unauthorized; // not logged in
-            var mainToken = GetMainToken();
-            if (mainToken == null) return AuthOperationResult.Unauthorized;
-            using var request = _appInfo.GetAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/logout"));
-            var response = await Web.ResolveRequestAsRestResponse(_appInfo.HttpClient, request)
-                .ConfigureAwait(false);
-            await _appInfo.ClearAuthenticationCredentials(deletePersistedCredentials: true);
-            if (LoggedOut != null)
-                await LoggedOut.Invoke().ConfigureAwait(false);
-            return response.Status switch
+            try
             {
+                HttpStatusCode status = HttpStatusCode.OK;
+                foreach (var token in new[]
+                         {
+                             _credentialStore.GetToken(JwtTokenKind.Elevated),
+                             _credentialStore.GetToken(JwtTokenKind.App)
+                         }.Where(token => token?.IsValid == true))
+                {
+                    if (token == null) return AuthOperationResult.Unauthorized;
+                    using var request =
+                        _appInfo.GetAuthenticatedHttpRequestTo(new Uri($"{_appInfo.ApiUrl}/auth/logout"));
+                    var response = await Web.ResolveRequestAsRestResponse(_appInfo.HttpClient, request)
+                        .ConfigureAwait(false);
+                    if (response.Status > 0 && response.Status != HttpStatusCode.OK) status = response.Status;
+                }
+
+                return status switch
+                {
 #if WINDOWS_UWP
-                HttpStatusCode.Ok => AuthOperationResult.Success,
+                    HttpStatusCode.Ok => AuthOperationResult.Success,
 #else
-                HttpStatusCode.OK => AuthOperationResult.Success,
+                    HttpStatusCode.OK => AuthOperationResult.Success,
 #endif
-                HttpStatusCode.Unauthorized => AuthOperationResult.Unauthorized | AuthOperationResult.NoOp,
-                _ => AuthOperationResult.ErrorCannotDetermine,
-            };
+                    HttpStatusCode.Unauthorized => AuthOperationResult.Unauthorized | AuthOperationResult.NoOp,
+                    _ => AuthOperationResult.ErrorCannotDetermine,
+                };
+            }
+            finally
+            {
+                await _appInfo.ClearAuthenticationCredentials(deletePersistedCredentials: true);
+                if (LoggedOut != null)
+                    await LoggedOut.Invoke().ConfigureAwait(false);
+            }
         }
 
         public async Task<AuthOperationResult> ValidateTokenAsync(JwtTokenKind kind)

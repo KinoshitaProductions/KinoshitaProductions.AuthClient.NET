@@ -10,27 +10,50 @@ using JsonPropertyAttribute = Newtonsoft.Json.JsonPropertyAttribute;
 
 internal sealed class Token
 {
-    internal Token(JwtTokenKind kind, string value)
+    internal static Token? ParseTokenOrClearField(ref string? jwtToken, ref Token? tokenCache)
     {
-        Kind = kind;
-        Value = value;
-    }
-    internal JwtTokenKind Kind { get; }
-    internal string Value { get; }
-    private JwtSecurityToken? _parsedValue;
-    internal JwtSecurityToken ParsedValue => _parsedValue ??= new JwtSecurityTokenHandler().ReadJwtToken(Value); // TODO: Must ensure we catch this, ideally when reading tokens
-    internal DateTime ExpirationDate
-    {
-        get
+        if (tokenCache != null) return tokenCache;
+        if (jwtToken == null) return null;
+        try
         {
-            var expirationDate = ParsedValue.ValidTo;
-            return expirationDate == DateTime.MinValue ? DateTime.MaxValue : expirationDate;
+            if (string.IsNullOrWhiteSpace(jwtToken))
+                return null;
+            var tokenHandler = new JwtSecurityTokenHandler();
+            if (!tokenHandler.CanReadToken(jwtToken))
+                return null;
+            JwtSecurityToken parsedToken = tokenHandler.ReadJwtToken(jwtToken);
+            var key = parsedToken.Claims.FirstOrDefault(claim => claim.Type == "key")?.Value;
+            if (string.IsNullOrEmpty(key) || key.Length < 2)
+                return null;
+            JwtTokenKind kind = key[1] switch
+            {
+                'E' => JwtTokenKind.Elevated,
+                'A' => JwtTokenKind.App,
+                'S' => JwtTokenKind.Session,
+                _ => JwtTokenKind.NotSpecified,
+            };
+            if (kind == JwtTokenKind.NotSpecified)
+                return null;
+            return tokenCache = new Token(kind, parsedToken.IssuedAt, parsedToken.ValidTo);
+        } finally {
+            if (tokenCache == null) jwtToken = null;
         }
     }
+    internal Token(JwtTokenKind kind, DateTime issuedAt, DateTime expirationDate)
+    {
+        Kind = kind;
+        IssuedAt = issuedAt;
+        ExpirationDate = expirationDate;
+    }
+    internal JwtTokenKind Kind { get; }
+   // private JwtSecurityToken? _parsedValue;
+    //internal JwtSecurityToken ParsedValue => _parsedValue ??= new JwtSecurityTokenHandler().ReadJwtToken(Value); // TODO: Must ensure we catch this, ideally when reading tokens
+    internal DateTime IssuedAt { get; }
+    internal DateTime ExpirationDate { get; }
 
-    private TimeSpan Age => DateTime.UtcNow - ParsedValue.IssuedAt;
-    private TimeSpan StillValidFor => ParsedValue.ValidTo - DateTime.UtcNow;
-    internal bool IsValid => ParsedValue.ValidTo > DateTime.UtcNow;
+    private TimeSpan Age => DateTime.UtcNow - IssuedAt;
+    private TimeSpan StillValidFor => ExpirationDate - DateTime.UtcNow;
+    internal bool IsValid => ExpirationDate > DateTime.UtcNow;
     internal bool ShouldConsiderRenewal => _needsRenewal || Age > TimeSpan.FromDays(7) || StillValidFor < TimeSpan.FromDays(7);
     private bool _needsRenewal;
     internal void FlagForRenewal()
@@ -39,71 +62,79 @@ internal sealed class Token
     }
 }
 
-internal sealed class JwtTokenResponse
-{
-    public JwtTokenResponse() {}
-
-    public JwtTokenResponse(IJwtAuthenticatedServiceAppInfo appInfo)
+internal class JwtCredentialsStore
+{    
+    private IJwtAuthenticatedServiceAppInfo? _appInfo;
+    public JwtCredentialsStore() {}
+    public void LinkToAppInfo(IJwtAuthenticatedServiceAppInfo appInfo)
     {
         _appInfo = appInfo;
     }
-
-    private readonly IJwtAuthenticatedServiceAppInfo? _appInfo;
-    private readonly Token?[] _tokenCache = new Token?[4];
-    public bool HasToken(JwtTokenKind kind) => GetToken(kind)?.IsValid == true;
-    public Token? GetToken(JwtTokenKind kind)
+    [JsonProperty("et")]
+    internal string? ElevatedToken
     {
-        var value = kind switch
+        get => _elevatedToken;
+        set { if (_elevatedToken != value) { _elevatedToken = value; _elevatedTokenCache = null; } }
+    }
+
+    private string? _elevatedToken;
+
+    private Token? _elevatedTokenCache;
+
+    [JsonProperty("at")]
+    internal string? AppToken
+    {
+        get => _appToken;
+        set { if (_appToken != value) { _appToken = value; _appTokenCache = null; } }
+    }
+    private string? _appToken;
+
+    private Token? _appTokenCache;
+
+    [JsonProperty("st")]
+    internal string? SessionToken
+    {
+        get => _sessionToken;
+        set { if (_sessionToken != value) { _sessionToken = value; _sessionTokenCache = null; } }
+    }
+    private string? _sessionToken;
+    private Token? _sessionTokenCache;
+
+    public bool HasToken(JwtTokenKind kind) => GetToken(kind)?.IsValid == true;
+    public Token? GetToken(JwtTokenKind kind) =>
+        kind switch
         {
-            JwtTokenKind.Elevated => ElevatedToken,
-            JwtTokenKind.App => AppToken,
-            JwtTokenKind.Session => SessionToken,
+            JwtTokenKind.Elevated => Token.ParseTokenOrClearField(ref _elevatedToken, ref _elevatedTokenCache),
+            JwtTokenKind.App => Token.ParseTokenOrClearField(ref _appToken, ref _appTokenCache),
+            JwtTokenKind.Session => Token.ParseTokenOrClearField(ref _sessionToken, ref _sessionTokenCache),
             _ => throw new ArgumentException($"Invalid token kind {kind} specified"),
         };
-        return value == null ? null : _tokenCache[(int)kind] ??= new Token(kind, value);
-    }
-
-    public bool CanRead()
+    
+    internal JwtCredentialsStore WithoutElevatedTokenForStoring()
     {
-        try
+        return new JwtCredentialsStore
         {
-            foreach (var token in _tokenCache) _ = token?.ParsedValue;
-        }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "Failed to read one of the stored tokens");
-            return false;
-        }
-        return true;
-    }
-
-    public void MergeTokensFrom(JwtTokenResponse response)
-    {
-        ElevatedToken = response.ElevatedToken ?? ElevatedToken;
-        AppToken = response.AppToken ?? AppToken;
-        SessionToken = response.SessionToken ?? SessionToken;
-        for (var i = 0; i < _tokenCache.Length; ++i) _tokenCache[i] = null;
-        _appInfo?.SetJwtAuthenticationCredentials(ElevatedToken, AppToken, SessionToken);
-    }
-    public async Task ClearTokens()
-    {
-        if (_appInfo != null)
-            await _appInfo.ClearAuthenticationCredentials().ConfigureAwait(false);
-        for (var i = 0; i < _tokenCache.Length; ++i) _tokenCache[i] = null;
-    }
-    [JsonProperty("et")]
-    public string? ElevatedToken { get; set; }
-    [JsonProperty("at")]
-    public string? AppToken { get; set; }
-    [JsonProperty("st")]
-    public string? SessionToken { get; set; }
-
-    internal JwtTokenResponse WithoutElevatedToken()
-    {
-        return new JwtTokenResponse
-        {
-            AppToken = AppToken,
-            SessionToken = SessionToken,
+            _appToken = _appToken,
+            _sessionToken = _sessionToken,
         };
     }
+    public void MergeTokensFrom(JwtCredentialsStore merging)
+    {
+        ElevatedToken = merging.ElevatedToken ?? ElevatedToken;
+        AppToken = merging.AppToken ?? AppToken;
+        SessionToken = merging.SessionToken ?? SessionToken;
+        _appInfo?.SetJwtAuthenticationCredentials(ElevatedToken, AppToken, SessionToken);
+    }
+
+    public JwtCredentialsStore Sanitize()
+    {
+        GetToken(JwtTokenKind.Elevated);
+        GetToken(JwtTokenKind.App);
+        GetToken(JwtTokenKind.Session);
+        return this;
+    }
+}
+// currently these two share the scheme for JSON fully
+internal sealed class JwtTokenResponse : JwtCredentialsStore
+{
 }
